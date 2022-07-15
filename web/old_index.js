@@ -8,9 +8,8 @@ import { Shopify, LATEST_API_VERSION } from "@shopify/shopify-api";
 import applyAuthMiddleware from "./middleware/auth.js";
 import verifyRequest from "./middleware/verify-request.js";
 import { setupGDPRWebHooks } from "./gdpr.js";
+import productCreator from "./helpers/product-creator.js";
 import { BillingInterval } from "./helpers/ensure-billing.js";
-import { QRCodesDB } from "./qr-codes-db.js";
-import applyQrCodeApiEndpoints from "./middleware/qr-code-api.js";
 
 const USE_ONLINE_TOKENS = false;
 const TOP_LEVEL_OAUTH_COOKIE = "shopify_top_level_oauth";
@@ -18,21 +17,12 @@ const TOP_LEVEL_OAUTH_COOKIE = "shopify_top_level_oauth";
 const PORT = parseInt(process.env.BACKEND_PORT || process.env.PORT, 10);
 const isTest = process.env.NODE_ENV === "test" || !!process.env.VITE_TEST_BUILD;
 
-const versionFilePath = "./version.txt";
-let templateVersion = "unknown";
-if (fs.existsSync(versionFilePath)) {
-  templateVersion = fs.readFileSync(versionFilePath, "utf8").trim();
-}
-
 // TODO: There should be provided by env vars
 const DEV_INDEX_PATH = `${process.cwd()}/frontend/`;
 const PROD_INDEX_PATH = `${process.cwd()}/frontend/dist/`;
 
-const dbFile = join(process.cwd(), "database.sqlite");
-const sessionDb = new Shopify.Session.SQLiteSessionStorage(dbFile);
-// Initialize SQLite DB
-QRCodesDB.db = sessionDb.db;
-QRCodesDB.init();
+const DB_PATH = `${process.cwd()}/database.sqlite`;
+
 Shopify.Context.initialize({
   API_KEY: process.env.SHOPIFY_API_KEY,
   API_SECRET_KEY: process.env.SHOPIFY_API_SECRET,
@@ -41,7 +31,8 @@ Shopify.Context.initialize({
   HOST_SCHEME: process.env.HOST.split("://")[0],
   API_VERSION: LATEST_API_VERSION,
   IS_EMBEDDED_APP: true,
-  SESSION_STORAGE: sessionDb,
+  // This should be replaced with your preferred storage strategy
+  SESSION_STORAGE: new Shopify.Session.SQLiteSessionStorage(DB_PATH),
 });
 
 // Storing the currently active shops in memory will force them to re-login when your server restarts. You should
@@ -93,10 +84,10 @@ export async function createServer(
     try {
       await Shopify.Webhooks.Registry.process(req, res);
       console.log(`Webhook processed, returned status code 200`);
-    } catch (error) {
-      console.log(`Failed to process webhook: ${error}`);
+    } catch (e) {
+      console.log(`Failed to process webhook: ${e.message}`);
       if (!res.headersSent) {
-        res.status(500).send(error.message);
+        res.status(500).send(e.message);
       }
     }
   });
@@ -110,7 +101,11 @@ export async function createServer(
   );
 
   app.get("/api/products/count", async (req, res) => {
-    const session = await Shopify.Utils.loadCurrentSession(req, res, false);
+    const session = await Shopify.Utils.loadCurrentSession(
+      req,
+      res,
+      app.get("use-online-tokens")
+    );
     const { Product } = await import(
       `@shopify/shopify-api/dist/rest-resources/${Shopify.Context.API_VERSION}/index.js`
     );
@@ -119,9 +114,26 @@ export async function createServer(
     res.status(200).send(countData);
   });
 
-  app.use(express.json());
+  app.get("/api/products/create", async (req, res) => {
+    const session = await Shopify.Utils.loadCurrentSession(
+      req,
+      res,
+      app.get("use-online-tokens")
+    );
+    let status = 200;
+    let error = null;
 
-  applyQrCodeApiEndpoints(app);
+    try {
+      await productCreator(session);
+    } catch (e) {
+      console.log(`Failed to process products/create: ${e.message}`);
+      status = 500;
+      error = e.message;
+    }
+    res.status(status).send({ success: status === 200, error });
+  });
+
+  app.use(express.json());
 
   app.use((req, res, next) => {
     const shop = req.query.shop;
@@ -144,7 +156,7 @@ export async function createServer(
       ({ default: fn }) => fn
     );
     app.use(compression());
-    app.use(serveStatic(PROD_INDEX_PATH));
+    app.use(serveStatic(PROD_INDEX_PATH, { index: false }));
   }
 
   app.use("/*", async (req, res, next) => {
